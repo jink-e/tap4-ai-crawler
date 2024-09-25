@@ -4,7 +4,7 @@ from typing import List, Optional
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Header, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel
 
 from website_crawler import WebsitCrawler
@@ -12,12 +12,12 @@ from website_crawler import WebsitCrawler
 app = FastAPI()
 website_crawler = WebsitCrawler()
 load_dotenv()
-system_auth_secret = os.getenv('AUTH_SECRET')
+system_auth_secret = os.getenv("AUTH_SECRET")
 
 # 设置日志记录
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(filename)s - %(funcName)s - %(lineno)d - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(filename)s - %(funcName)s - %(lineno)d - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,9 @@ class URLRequest(BaseModel):
     url: str
     tags: Optional[List[str]] = None
     languages: Optional[List[str]] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    detail: Optional[str] = None  # 新增 detail 字段
 
 
 class AsyncURLRequest(URLRequest):
@@ -33,83 +36,129 @@ class AsyncURLRequest(URLRequest):
     key: str
 
 
-@app.post('/site/crawl')
+@app.post("/site/crawl")
 async def scrape(request: URLRequest, authorization: Optional[str] = Header(None)):
     url = request.url
     tags = request.tags  # tag数组
     languages = request.languages  # 需要翻译的多语言列表
-
+    title = request.title
+    description = request.description
+    detail = request.detail  # 新增 detail
     if system_auth_secret:
         # 配置了非空的auth_secret，才验证
         validate_authorization(authorization)
 
-    result = await website_crawler.scrape_website(url.strip(), tags, languages)
+    result = await website_crawler.scrape_website(
+        url.strip(),
+        tags,
+        languages,
+        manual_title=title,
+        manual_description=description,
+        manual_detail=detail,
+    )
 
     # 若result为None,则 code="10001"，msg="处理异常，请稍后重试"
     code = 200
-    msg = 'success'
+    msg = "success"
     if result is None:
         code = 10001
-        msg = 'fail'
+        msg = "fail"
 
     # 将数据映射到 'data' 键下
-    response = {
-        'code': code,
-        'msg': msg,
-        'data': result
-    }
+    response = {"code": code, "msg": msg, "data": result}
     return response
 
 
-@app.post('/site/crawl_async')
-async def scrape_async(background_tasks: BackgroundTasks, request: AsyncURLRequest,
-                       authorization: Optional[str] = Header(None)):
+@app.post("/site/crawl_async")
+async def scrape_async(
+    background_tasks: BackgroundTasks,
+    request: AsyncURLRequest,
+    authorization: Optional[str] = Header(None),
+):
     url = request.url
     callback_url = request.callback_url
     key = request.key  # 请求回调接口，放header Authorization: 'Bear key'
     tags = request.tags  # tag数组
     languages = request.languages  # 需要翻译的多语言列表
-
+    title = request.title
+    description = request.description
+    detail = request.detail  # 新增 detail
     if system_auth_secret:
         # 配置了非空的auth_secret，才验证
         validate_authorization(authorization)
 
     # 直接发起异步请求:使用background_tasks后台运行
-    background_tasks.add_task(async_worker, url.strip(), tags, languages, callback_url, key)
+    background_tasks.add_task(
+        async_worker,
+        url.strip(),
+        tags,
+        languages,
+        callback_url,
+        key,
+        title,
+        description,
+        detail,  # 新增 detail
+    )
 
     # 若result为None,则 code="10001"，msg="处理异常，请稍后重试"
     code = 200
-    msg = 'success'
-    response = {
-        'code': code,
-        'msg': msg
-    }
+    msg = "success"
+    response = {"code": code, "msg": msg}
     return response
+
+
+@app.post("/crawl")
+async def crawl_website(request: Request):
+    data = await request.json()
+    url = data.get("url")
+    tags = data.get("tags", [])
+    languages = data.get("languages", [])
+    manual_title = data.get("title")
+    manual_description = data.get("description")
+    manual_detail = data.get("detail")  # 新增 detail
+
+    crawler = WebsitCrawler()
+    result = await crawler.scrape_website(
+        url, tags, languages, manual_title, manual_description, manual_detail
+    )
+
+    # ... rest of the existing code ...
 
 
 def validate_authorization(authorization):
     if not authorization:
         raise HTTPException(status_code=400, detail="Missing Authorization header")
-    if 'Bearer ' + system_auth_secret != authorization:
+    if "Bearer " + system_auth_secret != authorization:
         raise HTTPException(status_code=401, detail="Authorization is error")
 
 
-async def async_worker(url, tags, languages, callback_url, key):
+async def async_worker(
+    url, tags, languages, callback_url, key, title, description, detail
+):
     # 爬虫处理封装为一个异步任务
-    result = await website_crawler.scrape_website(url.strip(), tags, languages)
+    result = await website_crawler.scrape_website(
+        url.strip(),
+        tags,
+        languages,
+        manual_title=title,
+        manual_description=description,
+        manual_detail=detail,
+    )
     # 通过requests post 请求调用call_back_url， 携带参数result， heaer 为key
     try:
-        logger.info(f'callback begin:{callback_url}')
-        response = requests.post(callback_url, json=result, headers={'Authorization': 'Bearer ' + key})
+        logger.info(f"callback begin:{callback_url}")
+        response = requests.post(
+            callback_url, json=result, headers={"Authorization": "Bearer " + key}
+        )
         if response.status_code != 200:
-            logger.error(f'callback error:{callback_url}', response.text)
+            logger.error(f"callback error:{callback_url}", response.text)
         else:
-            logger.info(f'callback success:{callback_url}')
+            logger.info(f"callback success:{callback_url}")
     except Exception as e:
-        logger.error(f'call_back exception:{callback_url}', e)
+        logger.error(f"call_back exception:{callback_url}", e)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8040)
